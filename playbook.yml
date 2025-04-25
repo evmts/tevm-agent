@@ -1,0 +1,154 @@
+---
+- name: Provision a Hetzner Cloud server
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  collections:
+    - hetzner.hcloud
+
+  vars:
+    server_name: tevm-agent-01
+    server_type: ax41-nvme # AMD Ryzen 5 3600, 64GB RAM, 2x512GB NVMe
+    image: ubuntu-24.04 # or ubuntu-22.04
+    location: fsn1 # Frankfurt; pick your region
+    ssh_keys:
+      - your‐ssh‐key‐name # as registered in your Hetzner project
+
+  tasks:
+    - name: Create Ubuntu server on Hetzner
+      hcloud_server:
+        state: present
+        name: "{{ server_name }}"
+        server_type: "{{ server_type }}"
+        image: "{{ image }}"
+        location: "{{ location }}"
+        ssh_keys: "{{ ssh_keys }}"
+      register: new_server
+
+    - name: Wait for SSH to become available
+      wait_for:
+        host: "{{ new_server.server.public_net.ipv4.ip }}"
+        port: 22
+        delay: 10
+        timeout: 300
+
+    - name: Add the new server to our inventory
+      add_host:
+        name: "{{ new_server.server.public_net.ipv4.ip }}"
+        ansible_user: root
+        groups: docker_hosts
+
+- name: Install Docker and set up environment
+  hosts: docker_hosts
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Update APT cache
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install prerequisites for Docker
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+
+    - name: Add Docker's official GPG key
+      ansible.builtin.apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker APT repository
+      ansible.builtin.apt_repository:
+        repo: >-
+          deb [arch=amd64] https://download.docker.com/linux/ubuntu
+          {{ ansible_lsb.codename }} stable
+        state: present
+
+    - name: Update APT cache (after adding Docker repo)
+      apt:
+        update_cache: true
+
+    - name: Install Docker Engine
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: latest
+
+    - name: Ensure Docker is started & enabled
+      systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Add current user to docker group
+      user:
+        name: "{{ ansible_user_id }}"
+        groups: docker
+        append: true
+
+    - name: Create SSH directory for remote access
+      file:
+        path: /root/.ssh
+        state: directory
+        mode: "0700"
+
+    - name: Pull and run Ubuntu container for Claude Code
+      docker_container:
+        name: claude-code-container
+        image: ubuntu:latest
+        state: started
+        restart_policy: always
+        ports:
+          - "2222:22"
+        command: sleep infinity
+
+    - name: Install SSH server in container
+      shell: |
+        docker exec claude-code-container apt-get update
+        docker exec claude-code-container apt-get install -y openssh-server
+        docker exec claude-code-container mkdir -p /run/sshd
+        docker exec claude-code-container bash -c "echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config"
+        docker exec claude-code-container bash -c "echo 'root:password' | chpasswd"  # CHANGE THIS PASSWORD
+        docker exec claude-code-container service ssh start
+
+    - name: Copy Rust CLI project to server
+      synchronize:
+        src: /Users/williamcory/agent/tevm-agent/cli/
+        dest: /root/tevm-cli/
+        rsync_opts:
+          - "--exclude=target/"
+
+    - name: Build Docker image for Tevm CLI
+      docker_image:
+        name: tevm-cli
+        build:
+          path: /root/tevm-cli/
+        source: build
+        state: present
+
+    - name: Create script to launch multiple Claude Code instances with Tevm CLI
+      copy:
+        dest: /root/launch-claude-code.sh
+        content: |
+          #!/bin/bash
+          # Script to launch multiple Claude Code instances using tevm-cli
+
+          # Usage: ./launch-claude-code.sh <number_of_instances> "<prompt>"
+
+          INSTANCES=${1:-1}
+          PROMPT=${2:-"Hello, how can I help you?"}
+
+          for i in $(seq 1 $INSTANCES); do
+            docker run -d --name tevm-cli-$i tevm-cli --prompt "$PROMPT"
+            echo "Started Tevm CLI instance $i with Claude Code"
+          done
+        mode: "0755"
